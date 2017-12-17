@@ -52,15 +52,15 @@
 #include "blkid-util.h"
 #include "btrfs-util.h"
 #include "bus-util.h"
-#include "cap-list.h"
 #include "capability-util.h"
+#include "cap-list.h"
 #include "cgroup-util.h"
 #include "copy.h"
 #include "dev-setup.h"
 #include "dissect-image.h"
 #include "env-util.h"
-#include "fd-util.h"
 #include "fdset.h"
+#include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
@@ -69,8 +69,8 @@
 #include "hostname-util.h"
 #include "id128-util.h"
 #include "log.h"
-#include "loop-util.h"
 #include "loopback-setup.h"
+#include "loop-util.h"
 #include "machine-image.h"
 #include "macro.h"
 #include "missing.h"
@@ -79,6 +79,7 @@
 #include "netlink-util.h"
 #include "nspawn-cgroup.h"
 #include "nspawn-def.h"
+#include "nspawn-device.h"
 #include "nspawn-expose-ports.h"
 #include "nspawn-mount.h"
 #include "nspawn-network.h"
@@ -88,6 +89,7 @@
 #include "nspawn-settings.h"
 #include "nspawn-setuid.h"
 #include "nspawn-stub-pid1.h"
+#include "nspawn-userns.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -287,6 +289,10 @@ static void help(void) {
                "                            the container\n"
                "     --bind-ro=PATH[:PATH[:OPTIONS]\n"
                "                            Similar, but creates a read-only bind mount\n"
+               "     --make-device=PATH:MAJOR,MINOR\n"
+               "                            Create a device inside the container\n"
+               "     --copy-device=PATH[:PATH]\n"
+               "                            Copy a device from the host into the container\n"
                "     --tmpfs=PATH:[OPTIONS] Mount an empty tmpfs to the specified directory\n"
                "     --overlay=PATH[:PATH...]:PATH\n"
                "                            Create an overlay mount from the host to \n"
@@ -1282,48 +1288,6 @@ static int verify_arguments(void) {
         return 0;
 }
 
-static int userns_lchown(const char *p, uid_t uid, gid_t gid) {
-        assert(p);
-
-        if (arg_userns_mode == USER_NAMESPACE_NO)
-                return 0;
-
-        if (uid == UID_INVALID && gid == GID_INVALID)
-                return 0;
-
-        if (uid != UID_INVALID) {
-                uid += arg_uid_shift;
-
-                if (uid < arg_uid_shift || uid >= arg_uid_shift + arg_uid_range)
-                        return -EOVERFLOW;
-        }
-
-        if (gid != GID_INVALID) {
-                gid += (gid_t) arg_uid_shift;
-
-                if (gid < (gid_t) arg_uid_shift || gid >= (gid_t) (arg_uid_shift + arg_uid_range))
-                        return -EOVERFLOW;
-        }
-
-        if (lchown(p, uid, gid) < 0)
-                return -errno;
-
-        return 0;
-}
-
-static int userns_mkdir(const char *root, const char *path, mode_t mode, uid_t uid, gid_t gid) {
-        const char *q;
-
-        q = prefix_roota(root, path);
-        if (mkdir(q, mode) < 0) {
-                if (errno == EEXIST)
-                        return 0;
-                return -errno;
-        }
-
-        return userns_lchown(q, uid, gid);
-}
-
 static int setup_timezone(const char *dest) {
         _cleanup_free_ char *p = NULL, *q = NULL;
         const char *where, *check, *what;
@@ -1387,7 +1351,7 @@ static int setup_timezone(const char *dest) {
                 return 0;
         }
 
-        r = userns_lchown(where, 0, 0);
+        r = userns_lchown(arg_userns_mode, arg_uid_shift, arg_uid_range, where, 0, 0);
         if (r < 0)
                 return log_warning_errno(r, "Failed to chown /etc/localtime: %m");
 
@@ -1475,7 +1439,7 @@ static int setup_resolv_conf(const char *dest) {
                 return 0;
         }
 
-        r = userns_lchown(where, 0, 0);
+        r = userns_lchown(arg_userns_mode, arg_uid_shift, arg_uid_range, where, 0, 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to chown /etc/resolv.conf, ignoring: %m");
 
@@ -1508,147 +1472,6 @@ static int setup_boot_id(const char *dest) {
 
         (void) unlink(from);
         return r;
-}
-
-static int copy_devnodes(const char *dest) {
-
-        static const char devnodes[] =
-                "null\0"
-                "zero\0"
-                "full\0"
-                "random\0"
-                "urandom\0"
-                "tty\0"
-                "net/tun\0";
-
-        const char *d;
-        int r = 0;
-        _cleanup_umask_ mode_t u;
-
-        assert(dest);
-
-        u = umask(0000);
-
-        /* Create /dev/net, so that we can create /dev/net/tun in it */
-        if (userns_mkdir(dest, "/dev/net", 0755, 0, 0) < 0)
-                return log_error_errno(r, "Failed to create /dev/net directory: %m");
-
-        NULSTR_FOREACH(d, devnodes) {
-                _cleanup_free_ char *from = NULL, *to = NULL;
-                struct stat st;
-
-                from = strappend("/dev/", d);
-                to = prefix_root(dest, from);
-
-                if (stat(from, &st) < 0) {
-
-                        if (errno != ENOENT)
-                                return log_error_errno(errno, "Failed to stat %s: %m", from);
-
-                } else if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
-
-                        log_error("%s is not a char or block device, cannot copy.", from);
-                        return -EIO;
-
-                } else {
-                        if (mknod(to, st.st_mode, st.st_rdev) < 0) {
-                                /* Explicitly warn the user when /dev is already populated. */
-                                if (errno == EEXIST)
-                                        log_notice("%s/dev is pre-mounted and pre-populated. If a pre-mounted /dev is provided it needs to be an unpopulated file system.", dest);
-                                if (errno != EPERM)
-                                        return log_error_errno(errno, "mknod(%s) failed: %m", to);
-
-                                /* Some systems abusively restrict mknod but
-                                 * allow bind mounts. */
-                                r = touch(to);
-                                if (r < 0)
-                                        return log_error_errno(r, "touch (%s) failed: %m", to);
-                                r = mount_verbose(LOG_DEBUG, from, to, NULL, MS_BIND, NULL);
-                                if (r < 0)
-                                        return log_error_errno(r, "Both mknod and bind mount (%s) failed: %m", to);
-                        }
-
-                        r = userns_lchown(to, 0, 0);
-                        if (r < 0)
-                                return log_error_errno(r, "chown() of device node %s failed: %m", to);
-                }
-        }
-
-        return r;
-}
-
-static int setup_pts(const char *dest) {
-        _cleanup_free_ char *options = NULL;
-        const char *p;
-        int r;
-
-#if HAVE_SELINUX
-        if (arg_selinux_apifs_context)
-                (void) asprintf(&options,
-                                "newinstance,ptmxmode=0666,mode=620,gid=" GID_FMT ",context=\"%s\"",
-                                arg_uid_shift + TTY_GID,
-                                arg_selinux_apifs_context);
-        else
-#endif
-                (void) asprintf(&options,
-                                "newinstance,ptmxmode=0666,mode=620,gid=" GID_FMT,
-                                arg_uid_shift + TTY_GID);
-
-        if (!options)
-                return log_oom();
-
-        /* Mount /dev/pts itself */
-        p = prefix_roota(dest, "/dev/pts");
-        if (mkdir(p, 0755) < 0)
-                return log_error_errno(errno, "Failed to create /dev/pts: %m");
-        r = mount_verbose(LOG_ERR, "devpts", p, "devpts", MS_NOSUID|MS_NOEXEC, options);
-        if (r < 0)
-                return r;
-        r = userns_lchown(p, 0, 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to chown /dev/pts: %m");
-
-        /* Create /dev/ptmx symlink */
-        p = prefix_roota(dest, "/dev/ptmx");
-        if (symlink("pts/ptmx", p) < 0)
-                return log_error_errno(errno, "Failed to create /dev/ptmx symlink: %m");
-        r = userns_lchown(p, 0, 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to chown /dev/ptmx: %m");
-
-        /* And fix /dev/pts/ptmx ownership */
-        p = prefix_roota(dest, "/dev/pts/ptmx");
-        r = userns_lchown(p, 0, 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to chown /dev/pts/ptmx: %m");
-
-        return 0;
-}
-
-static int setup_dev_console(const char *dest, const char *console) {
-        _cleanup_umask_ mode_t u;
-        const char *to;
-        int r;
-
-        assert(dest);
-        assert(console);
-
-        u = umask(0000);
-
-        r = chmod_and_chown(console, 0600, arg_uid_shift, arg_uid_shift);
-        if (r < 0)
-                return log_error_errno(r, "Failed to correct access mode for TTY: %m");
-
-        /* We need to bind mount the right tty to /dev/console since
-         * ptys can only exist on pts file systems. To have something
-         * to bind mount things on we create a empty regular file. */
-
-        to = prefix_roota(dest, "/dev/console");
-        r = touch(to);
-        if (r < 0)
-                return log_error_errno(r, "touch() for /dev/console failed: %m");
-
-        return mount_verbose(LOG_ERR, console, to, NULL, MS_BIND, NULL);
 }
 
 static int setup_keyring(void) {
@@ -1766,15 +1589,15 @@ static int setup_journal(const char *directory) {
                 return -EEXIST;
         }
 
-        r = userns_mkdir(directory, "/var", 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, "/var", 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /var: %m");
 
-        r = userns_mkdir(directory, "/var/log", 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, "/var/log", 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /var/log: %m");
 
-        r = userns_mkdir(directory, "/var/log/journal", 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, "/var/log/journal", 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /var/log/journal: %m");
 
@@ -1804,7 +1627,7 @@ static int setup_journal(const char *directory) {
                 if (IN_SET(arg_link_journal, LINK_GUEST, LINK_AUTO) &&
                     path_equal(d, q)) {
 
-                        r = userns_mkdir(directory, p, 0755, 0, 0);
+                        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, p, 0755, 0, 0);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to create directory %s: %m", q);
                         return 0;
@@ -1836,7 +1659,7 @@ static int setup_journal(const char *directory) {
                                 return log_error_errno(errno, "Failed to symlink %s to %s: %m", q, p);
                 }
 
-                r = userns_mkdir(directory, p, 0755, 0, 0);
+                r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, p, 0755, 0, 0);
                 if (r < 0)
                         log_warning_errno(r, "Failed to create directory %s: %m", q);
                 return 0;
@@ -1860,7 +1683,7 @@ static int setup_journal(const char *directory) {
         if (dir_is_empty(q) == 0)
                 log_warning("%s is not empty, proceeding anyway.", q);
 
-        r = userns_mkdir(directory, p, 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, directory, p, 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create %s: %m", q);
 
@@ -1917,15 +1740,15 @@ static int setup_propagate(const char *root) {
         p = strjoina("/run/systemd/nspawn/propagate/", arg_machine);
         (void) mkdir_p(p, 0600);
 
-        r = userns_mkdir(root, "/run/systemd", 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, root, "/run/systemd", 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd: %m");
 
-        r = userns_mkdir(root, "/run/systemd/nspawn", 0755, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, root, "/run/systemd/nspawn", 0755, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd/nspawn: %m");
 
-        r = userns_mkdir(root, "/run/systemd/nspawn/incoming", 0600, 0, 0);
+        r = userns_mkdir(arg_userns_mode, arg_uid_shift, arg_uid_range, root, "/run/systemd/nspawn/incoming", 0600, 0, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd/nspawn/incoming: %m");
 
@@ -2527,7 +2350,7 @@ static int setup_sd_notify_child(void) {
                 return log_error_errno(errno, "bind(%s) failed: %m", sa.un.sun_path);
         }
 
-        r = userns_lchown(NSPAWN_NOTIFY_SOCKET_PATH, 0, 0);
+        r = userns_lchown(arg_userns_mode, arg_uid_shift, arg_uid_range, NSPAWN_NOTIFY_SOCKET_PATH, 0, 0);
         if (r < 0) {
                 safe_close(fd);
                 return log_error_errno(r, "Failed to chown " NSPAWN_NOTIFY_SOCKET_PATH ": %m");
@@ -2740,13 +2563,13 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        r = copy_devnodes(directory);
+        r = copy_devnodes(directory, arg_userns_mode, arg_uid_shift, arg_uid_range);
         if (r < 0)
                 return r;
 
         dev_setup(directory, arg_uid_shift, arg_uid_shift);
 
-        r = setup_pts(directory);
+        r = setup_pts(directory, arg_selinux_apifs_context, arg_userns_mode, arg_uid_shift, arg_uid_range);
         if (r < 0)
                 return r;
 
@@ -2754,7 +2577,7 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        r = setup_dev_console(directory, console);
+        r = setup_dev_console(directory, console, arg_userns_mode, arg_uid_shift, arg_uid_range);
         if (r < 0)
                 return r;
 

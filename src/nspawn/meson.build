@@ -23,6 +23,10 @@ systemd_nspawn_sources = files('''
         nspawn-expose-ports.h
         nspawn-mount.c
         nspawn-mount.h
+        nspawn-device.c
+        nspawn-device.h
+        nspawn-userns.c
+        nspawn-userns.h
         nspawn-network.c
         nspawn-network.h
         nspawn-patch-uid.c
